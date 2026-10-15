@@ -1,0 +1,10 @@
+{
+  "name": "@dinepoint/ui-web",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Reusable web components.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  }
+}
