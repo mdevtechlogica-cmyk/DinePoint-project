@@ -1,0 +1,30 @@
+# Render Blueprint for the Nest API (Free web service).
+# Dashboard: New → Blueprint → connect this repo.
+services:
+  - type: web
+    name: dinepoint-api
+    runtime: node
+    plan: free
+    rootDir: apps/api
+    buildCommand: npm install --include=dev && npm run build
+    startCommand: npm run start:prod
+    preDeployCommand: npx prisma migrate deploy
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: DIRECT_URL
+        sync: false
+      - key: JWT_ACCESS_SECRET
+        sync: false
+      - key: JWT_ACCESS_EXPIRES_IN
+        value: 7d
+      - key: JWT_REFRESH_EXPIRES_DAYS
+        value: "30"
+      - key: EXPOSE_PASSWORD_RESET_TOKEN
+        value: "false"
+      - key: PASSWORD_RESET_APP_URL
+        value: dinepoint://reset-password
