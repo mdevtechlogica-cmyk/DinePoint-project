@@ -16,6 +16,9 @@ import {
 import { randomBytes } from 'crypto';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { CreateReservationDto } from './dto/create-reservation.dto.js';
+import { CreateWalkInDto } from './dto/create-walk-in.dto.js';
+import { ListReservationsQueryDto } from './dto/list-reservations-query.dto.js';
+import { ReservationReportQueryDto } from './dto/reservation-report-query.dto.js';
 import { LookupReservationDto } from './dto/lookup-reservation.dto.js';
 import { CancelReservationDto } from './dto/cancel-reservation.dto.js';
 import { Logger } from '@nestjs/common';
@@ -396,6 +399,7 @@ export class ReservationsService {
     async listForRestaurant(
         organizationId: string,
         restaurantId: string,
+        query: ListReservationsQueryDto = {},
     ) {
         const restaurant = await this.prisma.restaurant.findFirst({
             where: {
@@ -411,17 +415,33 @@ export class ReservationsService {
             );
         }
 
+        const from = query.from ? new Date(query.from) : undefined;
+        const to = query.to ? new Date(query.to) : undefined;
+
+        if (
+            (from && Number.isNaN(from.getTime())) ||
+            (to && Number.isNaN(to.getTime())) ||
+            (from && to && from >= to)
+        ) {
+            throw new BadRequestException('Provide a valid date range.');
+        }
+
         return this.prisma.reservation.findMany({
-            where: { restaurantId },
-            include: {
-                tables: {
-                    include: {
-                        table: true,
-                    },
-                },
+            where: {
+                restaurantId,
+                ...(query.status ? { status: query.status } : {}),
+                ...(from || to
+                    ? {
+                          startsAt: {
+                              ...(from ? { gte: from } : {}),
+                              ...(to ? { lt: to } : {}),
+                          },
+                      }
+                    : {}),
             },
+            include: this.reservationDetailsInclude(),
             orderBy: { startsAt: 'desc' },
-            take: 100,
+            take: from || to ? 500 : 100,
         });
     }
 
@@ -439,11 +459,7 @@ export class ReservationsService {
                 },
             },
             include: {
-                tables: {
-                    include: {
-                        table: true,
-                    },
-                },
+                ...this.reservationDetailsInclude(),
                 events: {
                     orderBy: { createdAt: 'asc' },
                 },
@@ -465,6 +481,343 @@ export class ReservationsService {
         restaurantId: string,
         reservationId: string,
         nextStatus: ReservationStatus,
+    ) {
+        await this.assertReservationAccess(organizationId, userId);
+
+        const reservation = await this.getForRestaurant(
+            organizationId,
+            restaurantId,
+            reservationId,
+        );
+
+        const allowedTransitions: Record<
+            ReservationStatus,
+            ReservationStatus[]
+        > = {
+            PENDING: [
+                ReservationStatus.CONFIRMED,
+                ReservationStatus.REJECTED,
+                ReservationStatus.CANCELLED,
+                ReservationStatus.SEATED,
+                ReservationStatus.NO_SHOW,
+            ],
+            CONFIRMED: [
+                ReservationStatus.CANCELLED,
+                ReservationStatus.SEATED,
+                ReservationStatus.NO_SHOW,
+            ],
+            SEATED: [
+                ReservationStatus.COMPLETED,
+                ReservationStatus.CANCELLED,
+            ],
+            CANCELLED: [],
+            REJECTED: [],
+            COMPLETED: [],
+            NO_SHOW: [],
+        };
+
+        if (
+            !allowedTransitions[reservation.status].includes(nextStatus)
+        ) {
+            throw new BadRequestException(
+                `Cannot change reservation from ${reservation.status} to ${nextStatus}.`,
+            );
+        }
+
+        return this.prisma.$transaction(async (tx) => {
+            const result = await tx.reservation.updateMany({
+                where: {
+                    id: reservationId,
+                    restaurantId,
+                    status: reservation.status,
+                    restaurant: {
+                        branch: {
+                            organizationId,
+                        },
+                    },
+                },
+                data: {
+                    status: nextStatus,
+                },
+            });
+        
+            if (result.count !== 1) {
+                throw new ConflictException(
+                    'The reservation status has changed. Refresh and try again.',
+                );
+            }
+        
+            await tx.reservationEvent.create({
+                data: {
+                    reservationId,
+                    eventType: `STATUS_${nextStatus}`,
+                    description:
+                        `Status changed from ${reservation.status} to ${nextStatus}`,
+                    actorUserId: userId,
+                },
+            });
+        
+            return {
+                ...reservation,
+                status: nextStatus,
+            };
+        });
+    }
+
+    async createWalkIn(
+        organizationId: string,
+        userId: string,
+        restaurantId: string,
+        dto: CreateWalkInDto,
+    ) {
+        await this.assertReservationAccess(organizationId, userId);
+        await this.findOrganizationRestaurant(organizationId, restaurantId);
+
+        const startsAt = dto.startsAt ? new Date(dto.startsAt) : new Date();
+        const endsAt = dto.endsAt
+            ? new Date(dto.endsAt)
+            : new Date(startsAt.getTime() + 90 * 60_000);
+
+        this.validateWalkInTime(startsAt, endsAt);
+
+        const created = await this.prisma.$transaction(
+            async (tx) => {
+                const table = await tx.restaurantTable.findFirst({
+                    where: {
+                        id: dto.tableId,
+                        restaurantId,
+                        isActive: true,
+                        seats: { gte: dto.guestCount },
+                        floor: { isActive: true },
+                        room: { isActive: true },
+                        reservations: {
+                            none: {
+                                reservation: {
+                                    startsAt: { lt: endsAt },
+                                    endsAt: { gt: startsAt },
+                                    status: {
+                                        in: [
+                                            ReservationStatus.PENDING,
+                                            ReservationStatus.CONFIRMED,
+                                            ReservationStatus.SEATED,
+                                        ],
+                                    },
+                                },
+                            },
+                        },
+                    },
+                    select: {
+                        id: true,
+                        tableNumber: true,
+                    },
+                });
+
+                if (!table) {
+                    const existing = await tx.restaurantTable.findFirst({
+                        where: { id: dto.tableId, restaurantId },
+                        select: { id: true, isActive: true, seats: true },
+                    });
+
+                    if (!existing) {
+                        throw new NotFoundException(
+                            'Table not found in this restaurant.',
+                        );
+                    }
+
+                    if (!existing.isActive || existing.seats < dto.guestCount) {
+                        throw new ConflictException(
+                            'This table cannot seat this party.',
+                        );
+                    }
+
+                    throw new ConflictException(
+                        'This table is already occupied for that time.',
+                    );
+                }
+
+                const reservation = await tx.reservation.create({
+                    data: {
+                        bookingCode: randomBytes(6).toString('hex').toUpperCase(),
+                        restaurantId,
+                        guestName: dto.guestName.trim(),
+                        guestPhone: dto.guestPhone.trim(),
+                        startsAt,
+                        endsAt,
+                        guestCount: dto.guestCount,
+                        status: ReservationStatus.SEATED,
+                        source: ReservationSource.WALK_IN,
+                        specialRequests: dto.specialRequests,
+                        createdByUserId: userId,
+                    },
+                });
+
+                await tx.reservationTable.create({
+                    data: {
+                        reservationId: reservation.id,
+                        tableId: table.id,
+                    },
+                });
+
+                await tx.reservationEvent.create({
+                    data: {
+                        reservationId: reservation.id,
+                        eventType: 'WALK_IN_SEATED',
+                        description: 'Walk-in guest seated',
+                        actorUserId: userId,
+                    },
+                });
+
+                return {
+                    id: reservation.id,
+                    bookingCode: reservation.bookingCode,
+                    status: reservation.status,
+                    source: reservation.source,
+                    startsAt: reservation.startsAt,
+                    endsAt: reservation.endsAt,
+                    guestName: reservation.guestName,
+                    guestPhone: reservation.guestPhone,
+                    guestCount: reservation.guestCount,
+                    tableNumber: table.tableNumber,
+                };
+            },
+            {
+                isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+            },
+        );
+
+        try {
+            await this.notificationsService.notifyRestaurantMembersForReservation(
+                created.id,
+                'Walk-in seated',
+                `${created.guestName} was seated at table ${created.tableNumber}.`,
+                'WALK_IN_SEATED',
+            );
+        } catch (error) {
+            this.logger.error(
+                'Failed to create walk-in notification',
+                error instanceof Error ? error.stack : String(error),
+            );
+        }
+
+        return created;
+    }
+
+    async reportForRestaurant(
+        organizationId: string,
+        restaurantId: string,
+        query: ReservationReportQueryDto,
+    ) {
+        const { from, to, where, rowWhere } = await this.prepareReport(
+            organizationId,
+            restaurantId,
+            query,
+        );
+        const page = query.page ?? 1;
+        const pageSize = query.pageSize ?? 25;
+
+        const [groups, totalCount, rows] = await Promise.all([
+            this.prisma.reservation.groupBy({
+                by: ['status'],
+                where,
+                _count: { _all: true },
+            }),
+            this.prisma.reservation.count({ where: rowWhere }),
+            this.prisma.reservation.findMany({
+                where: rowWhere,
+                include: this.reservationDetailsInclude(),
+                orderBy: { startsAt: 'desc' },
+                skip: (page - 1) * pageSize,
+                take: pageSize,
+            }),
+        ]);
+
+        return {
+            from: from.toISOString(),
+            to: to.toISOString(),
+            page,
+            pageSize,
+            totalCount,
+            totals: this.reportTotals(groups),
+            rows: rows.map((row) => this.toReportRow(row)),
+        };
+    }
+
+    async reportCsv(
+        organizationId: string,
+        restaurantId: string,
+        query: ReservationReportQueryDto,
+    ) {
+        const { rowWhere } = await this.prepareReport(
+            organizationId,
+            restaurantId,
+            query,
+        );
+        const rows = await this.prisma.reservation.findMany({
+            where: rowWhere,
+            include: this.reservationDetailsInclude(),
+            orderBy: { startsAt: 'desc' },
+            take: 5000,
+        });
+
+        const header = [
+            'Date and time',
+            'Guest name',
+            'Phone',
+            'Party size',
+            'Floor',
+            'Room',
+            'Table',
+            'Status',
+            'Staff member',
+            'Booking code',
+        ];
+        const lines = [
+            header,
+            ...rows.map((row) => {
+                const mapped = this.toReportRow(row);
+                return [
+                    mapped.startsAt,
+                    mapped.guestName,
+                    mapped.guestPhone,
+                    String(mapped.guestCount),
+                    mapped.floor?.name ?? '',
+                    mapped.room?.name ?? '',
+                    mapped.table ? `Table ${mapped.table.tableNumber}` : '',
+                    mapped.status,
+                    mapped.staff?.name ?? '',
+                    mapped.bookingCode,
+                ];
+            }),
+        ];
+
+        return lines
+            .map((line) =>
+                line.map((cell) => `"${cell.replaceAll('"', '""')}"`).join(','),
+            )
+            .join('\n');
+    }
+
+    private reservationDetailsInclude() {
+        return {
+            createdBy: {
+                select: { id: true, name: true },
+            },
+            tables: {
+                include: {
+                    table: {
+                        include: {
+                            floor: { select: { id: true, name: true } },
+                            room: { select: { id: true, name: true } },
+                        },
+                    },
+                },
+            },
+        };
+    }
+
+    private async assertReservationAccess(
+        organizationId: string,
+        userId: string,
     ) {
         const membership =
             await this.prisma.organizationMember.findFirst({
@@ -490,60 +843,220 @@ export class ReservationsService {
                 'You cannot manage reservations for this organization.',
             );
         }
+    }
 
-        const reservation = await this.getForRestaurant(
-            organizationId,
-            restaurantId,
-            reservationId,
-        );
+    private async findOrganizationRestaurant(
+        organizationId: string,
+        restaurantId: string,
+    ) {
+        const restaurant = await this.prisma.restaurant.findFirst({
+            where: {
+                id: restaurantId,
+                branch: { organizationId },
+            },
+            select: { id: true },
+        });
 
-        const allowedTransitions: Record<
-            ReservationStatus,
-            ReservationStatus[]
-        > = {
-            PENDING: [
-                ReservationStatus.CONFIRMED,
-                ReservationStatus.REJECTED,
-                ReservationStatus.CANCELLED,
-            ],
-            CONFIRMED: [
-                ReservationStatus.CANCELLED,
-                ReservationStatus.SEATED,
-                ReservationStatus.NO_SHOW,
-            ],
-            SEATED: [ReservationStatus.COMPLETED],
-            CANCELLED: [],
-            REJECTED: [],
-            COMPLETED: [],
-            NO_SHOW: [],
-        };
-
-        if (
-            !allowedTransitions[reservation.status].includes(nextStatus)
-        ) {
-            throw new BadRequestException(
-                `Cannot change reservation from ${reservation.status} to ${nextStatus}.`,
+        if (!restaurant) {
+            throw new NotFoundException(
+                'Restaurant not found in this organization.',
             );
         }
 
-        return this.prisma.$transaction(async (tx) => {
-            const updated = await tx.reservation.update({
-                where: { id: reservationId },
-                data: { status: nextStatus },
+        return restaurant;
+    }
+
+    private validateWalkInTime(startsAt: Date, endsAt: Date) {
+        if (
+            Number.isNaN(startsAt.getTime()) ||
+            Number.isNaN(endsAt.getTime()) ||
+            endsAt <= startsAt
+        ) {
+            throw new BadRequestException(
+                'Provide a start time and an end time after the start time.',
+            );
+        }
+
+        const durationMinutes = (endsAt.getTime() - startsAt.getTime()) / 60_000;
+
+        if (durationMinutes > 240) {
+            throw new BadRequestException(
+                'A reservation cannot exceed four hours.',
+            );
+        }
+
+        const now = Date.now();
+
+        if (startsAt.getTime() < now - 12 * 60 * 60 * 1000) {
+            throw new BadRequestException(
+                'A walk-in cannot start more than 12 hours ago.',
+            );
+        }
+
+        if (startsAt.getTime() > now + 15 * 60 * 1000) {
+            throw new BadRequestException(
+                'A walk-in must start now, not as a future reservation.',
+            );
+        }
+    }
+
+    private async prepareReport(
+        organizationId: string,
+        restaurantId: string,
+        query: ReservationReportQueryDto,
+    ) {
+        await this.findOrganizationRestaurant(organizationId, restaurantId);
+        const from = new Date(query.from);
+        const to = new Date(query.to);
+
+        if (
+            Number.isNaN(from.getTime()) ||
+            Number.isNaN(to.getTime()) ||
+            from >= to
+        ) {
+            throw new BadRequestException(
+                'The end of the range must be after the start.',
+            );
+        }
+
+        if (to.getTime() - from.getTime() > 366 * 24 * 60 * 60 * 1000) {
+            throw new BadRequestException(
+                'A report range cannot exceed 366 days.',
+            );
+        }
+
+        if (query.floorId) {
+            const floor = await this.prisma.floor.findFirst({
+                where: { id: query.floorId, restaurantId },
+                select: { id: true },
             });
 
-            await tx.reservationEvent.create({
-                data: {
-                    reservationId,
-                    eventType: `STATUS_${nextStatus}`,
-                    description:
-                        `Status changed from ${reservation.status} to ${nextStatus}`,
-                    actorUserId: userId,
+            if (!floor) {
+                throw new NotFoundException('Floor not found in this restaurant.');
+            }
+        }
+
+        if (query.roomId) {
+            const room = await this.prisma.room.findFirst({
+                where: {
+                    id: query.roomId,
+                    floor: {
+                        restaurantId,
+                        ...(query.floorId ? { id: query.floorId } : {}),
+                    },
                 },
+                select: { id: true },
             });
 
-            return updated;
-        });
+            if (!room) {
+                throw new NotFoundException('Room not found in this restaurant.');
+            }
+        }
+
+        if (query.staffUserId) {
+            const member = await this.prisma.organizationMember.findFirst({
+                where: {
+                    organizationId,
+                    userId: query.staffUserId,
+                },
+                select: { id: true },
+            });
+
+            if (!member) {
+                throw new NotFoundException(
+                    'Staff member not found in this organization.',
+                );
+            }
+        }
+
+        const where = this.reportWhere(restaurantId, query, from, to, false);
+        const rowWhere = this.reportWhere(restaurantId, query, from, to, true);
+
+        return { from, to, where, rowWhere };
+    }
+
+    private reportWhere(
+        restaurantId: string,
+        query: ReservationReportQueryDto,
+        from: Date,
+        to: Date,
+        includeStatus: boolean,
+    ): Prisma.ReservationWhereInput {
+        return {
+            restaurantId,
+            startsAt: { gte: from, lt: to },
+            ...(includeStatus && query.status ? { status: query.status } : {}),
+            ...(query.staffUserId ? { createdByUserId: query.staffUserId } : {}),
+            ...(query.floorId || query.roomId
+                ? {
+                      tables: {
+                          some: {
+                              table: {
+                                  ...(query.floorId ? { floorId: query.floorId } : {}),
+                                  ...(query.roomId ? { roomId: query.roomId } : {}),
+                              },
+                          },
+                      },
+                  }
+                : {}),
+        };
+    }
+
+    private reportTotals(
+        groups: { status: ReservationStatus; _count: { _all: number } }[],
+    ) {
+        const count = (status: ReservationStatus) =>
+            groups.find((group) => group.status === status)?._count._all ?? 0;
+
+        return {
+            total: groups.reduce((sum, group) => sum + group._count._all, 0),
+            pending: count(ReservationStatus.PENDING),
+            confirmed: count(ReservationStatus.CONFIRMED),
+            seated: count(ReservationStatus.SEATED),
+            completed: count(ReservationStatus.COMPLETED),
+            cancelled: count(ReservationStatus.CANCELLED),
+            rejected: count(ReservationStatus.REJECTED),
+            noShow: count(ReservationStatus.NO_SHOW),
+        };
+    }
+
+    private toReportRow(row: {
+        id: string;
+        bookingCode: string;
+        startsAt: Date;
+        guestName: string;
+        guestPhone: string;
+        guestCount: number;
+        status: ReservationStatus;
+        source: ReservationSource;
+        createdBy: { id: string; name: string } | null;
+        tables: {
+            table: {
+                id: string;
+                tableNumber: number;
+                floor: { id: string; name: string } | null;
+                room: { id: string; name: string } | null;
+            };
+        }[];
+    }) {
+        const table = row.tables[0]?.table;
+
+        return {
+            id: row.id,
+            bookingCode: row.bookingCode,
+            startsAt: row.startsAt.toISOString(),
+            guestName: row.guestName,
+            guestPhone: row.guestPhone,
+            guestCount: row.guestCount,
+            status: row.status,
+            source: row.source,
+            floor: table?.floor ?? null,
+            room: table?.room ?? null,
+            table: table
+                ? { id: table.id, tableNumber: table.tableNumber }
+                : null,
+            staff: row.createdBy,
+        };
     }
 
 

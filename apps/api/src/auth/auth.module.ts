@@ -18,9 +18,10 @@ import { JwtStrategy } from './strategies/jwt.strategy.js';
       useFactory: (config: ConfigService) => ({
         secret: config.getOrThrow<string>('JWT_ACCESS_SECRET'),
         signOptions: {
+          // Host-stand sessions need longer than a browser SPA default.
           expiresIn: config.get<string>(
             'JWT_ACCESS_EXPIRES_IN',
-            '15m',
+            '7d',
           ) as `${number}${'s' | 'm' | 'h' | 'd'}`,
         },
       }),

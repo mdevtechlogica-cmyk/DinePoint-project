@@ -8,12 +8,16 @@ import {
     Prisma,
   } from '@prisma/client';
   import { PrismaService } from '../prisma/prisma.service.js';
+  import { EntitlementsService } from '../entitlements/entitlements.service.js';
   import { CreateRestaurantDto } from './dto/create-restaurant.dto.js';
   import { UpdateRestaurantDto } from './dto/update-restaurant.dto.js';
   
   @Injectable()
   export class RestaurantsService {
-    constructor(private readonly prisma: PrismaService) {}
+    constructor(
+      private readonly prisma: PrismaService,
+      private readonly entitlements: EntitlementsService,
+    ) {}
   
     private async assertCanManage(
       organizationId: string,
@@ -62,6 +66,7 @@ import {
       dto: CreateRestaurantDto,
     ) {
       await this.assertCanManage(organizationId, userId);
+      await this.entitlements.assertCanCreateRestaurant(organizationId);
   
       const baseSlug =
         this.slugify(dto.restaurantName) || 'restaurant';

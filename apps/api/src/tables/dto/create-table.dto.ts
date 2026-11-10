@@ -23,6 +23,14 @@ import {
   
     @IsOptional()
     @IsString()
+    floorId?: string;
+
+    @IsOptional()
+    @IsString()
+    roomId?: string;
+
+    @IsOptional()
+    @IsString()
     @MaxLength(100)
     roomName?: string;
   

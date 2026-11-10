@@ -58,6 +58,31 @@ enum SubscriptionStatus {
   EXPIRED
 }
 
+enum PlatformRole {
+  SUPER_ADMIN
+  SUPPORT
+}
+
+enum SubscriptionEventAction {
+  CREATED
+  PLAN_CHANGED
+  STATUS_CHANGED
+  PERIOD_UPDATED
+  TRIAL_EXTENDED
+  CANCELLED
+}
+
+enum InvoiceStatus {
+  DUE
+  PAID
+  VOID
+}
+
+enum MessageChannel {
+  SMS
+  WHATSAPP
+}
+
 model User {
   id            String         @id @default(cuid())
   name          String
@@ -65,15 +90,24 @@ model User {
   passwordHash  String
   phone         String?
   status        UserStatus     @default(ACTIVE)
+  platformRole  PlatformRole?
   notifications Notification[]
   deviceTokens  DeviceToken[]
+  refreshTokens RefreshToken[]
+  passwordResetTokens PasswordResetToken[]
+  outboundMessages OutboundMessage[] @relation("OutboundMessageCreatedBy")
 
   memberships OrganizationMember[]
+  createdReservations Reservation[] @relation("ReservationCreatedBy")
+  subscriptionEvents SubscriptionEvent[]
+  invoicesCreated Invoice[] @relation("InvoiceCreatedBy")
+  platformAuditLogs PlatformAuditLog[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   @@index([status])
+  @@index([platformRole])
 }
 
 model Organization {
@@ -85,6 +119,9 @@ model Organization {
   memberships  OrganizationMember[]
   branches     Branch[]
   subscription Subscription?
+  invoices     Invoice[]
+  apiKeys      ApiKey[]
+  outboundMessages OutboundMessage[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -153,6 +190,7 @@ model Restaurant {
 
   branch       Branch            @relation(fields: [branchId], references: [id], onDelete: Cascade)
   openingHours OpeningHour[]
+  floors       Floor[]
   tables       RestaurantTable[]
   reservations Reservation[]
 
@@ -178,9 +216,45 @@ model OpeningHour {
   @@unique([restaurantId, dayOfWeek])
 }
 
+model Floor {
+  id           String  @id @default(cuid())
+  restaurantId String
+  name         String
+  sortOrder    Int     @default(0)
+  isActive     Boolean @default(true)
+
+  restaurant Restaurant        @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
+  rooms      Room[]
+  tables     RestaurantTable[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([restaurantId, name])
+  @@index([restaurantId, isActive])
+}
+
+model Room {
+  id       String  @id @default(cuid())
+  floorId  String
+  name     String
+  isActive Boolean @default(true)
+
+  floor  Floor             @relation(fields: [floorId], references: [id], onDelete: Cascade)
+  tables RestaurantTable[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([floorId, name])
+  @@index([floorId, isActive])
+}
+
 model RestaurantTable {
   id               String  @id @default(cuid())
   restaurantId     String
+  floorId          String
+  roomId           String
   floorNumber      Int     @default(1)
   roomName         String?
   tableNumber      Int
@@ -190,13 +264,17 @@ model RestaurantTable {
   isActive         Boolean @default(true)
 
   restaurant   Restaurant         @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
+  floor        Floor              @relation(fields: [floorId], references: [id], onDelete: Restrict)
+  room         Room               @relation(fields: [roomId], references: [id], onDelete: Restrict)
   reservations ReservationTable[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  @@unique([restaurantId, tableNumber])
+  @@unique([roomId, tableNumber])
   @@index([restaurantId, isActive])
+  @@index([floorId])
+  @@index([roomId])
 }
 
 model Customer {
@@ -236,9 +314,11 @@ model Reservation {
   status          ReservationStatus @default(PENDING)
   source          ReservationSource @default(PUBLIC_WEB)
   specialRequests String?
+  createdByUserId String?
 
   restaurant Restaurant         @relation(fields: [restaurantId], references: [id], onDelete: Restrict)
   customer   Customer?          @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  createdBy  User?              @relation("ReservationCreatedBy", fields: [createdByUserId], references: [id], onDelete: SetNull)
   tables     ReservationTable[]
   events     ReservationEvent[]
 
@@ -249,6 +329,7 @@ model Reservation {
   @@index([restaurantId, startsAt, status])
   @@index([customerId, startsAt])
   @@index([guestPhone, startsAt])
+  @@index([createdByUserId])
 }
 
 model ReservationTable {
@@ -288,6 +369,8 @@ model Plan {
 
   subscriptions Subscription[]
   entitlements  PlanEntitlement[]
+  eventsFrom    SubscriptionEvent[] @relation("SubscriptionEventFromPlan")
+  eventsTo      SubscriptionEvent[] @relation("SubscriptionEventToPlan")
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -322,13 +405,81 @@ model Subscription {
   providerCustomerId String?
   providerSubId      String?
 
-  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  plan         Plan         @relation(fields: [planId], references: [id], onDelete: Restrict)
+  organization Organization        @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  plan         Plan                @relation(fields: [planId], references: [id], onDelete: Restrict)
+  events       SubscriptionEvent[]
+  invoices     Invoice[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   @@index([planId, status])
+}
+
+model SubscriptionEvent {
+  id             String                   @id @default(cuid())
+  subscriptionId String
+  actorUserId    String?
+  action         SubscriptionEventAction
+  fromStatus     SubscriptionStatus?
+  toStatus       SubscriptionStatus?
+  fromPlanId     String?
+  toPlanId       String?
+  note           String?
+
+  subscription Subscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+  actor        User?        @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+  fromPlan     Plan?        @relation("SubscriptionEventFromPlan", fields: [fromPlanId], references: [id], onDelete: SetNull)
+  toPlan       Plan?        @relation("SubscriptionEventToPlan", fields: [toPlanId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+
+  @@index([subscriptionId, createdAt])
+  @@index([actorUserId])
+}
+
+model Invoice {
+  id               String        @id @default(cuid())
+  organizationId   String
+  subscriptionId   String?
+  amount           Decimal       @db.Decimal(10, 2)
+  currency         String        @default("INR")
+  status           InvoiceStatus @default(DUE)
+  periodStart      DateTime?
+  periodEnd        DateTime?
+  paymentReference String?
+  issuedAt         DateTime      @default(now())
+  paidAt           DateTime?
+  createdByUserId  String?
+
+  organization Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  subscription Subscription? @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
+  createdBy    User?         @relation("InvoiceCreatedBy", fields: [createdByUserId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([organizationId, status])
+  @@index([subscriptionId])
+  @@index([createdByUserId])
+}
+
+model PlatformAuditLog {
+  id          String  @id @default(cuid())
+  actorUserId String?
+  action      String
+  targetType  String
+  targetId    String?
+  description String?
+  metadata    Json?
+
+  actor User? @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+
+  @@index([actorUserId, createdAt])
+  @@index([targetType, targetId])
+  @@index([createdAt])
 }
 
 model Notification {
@@ -362,4 +513,75 @@ model DeviceToken {
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId, isActive])
+}
+
+model ApiKey {
+  id             String   @id @default(cuid())
+  organizationId String
+  createdByUserId String
+
+  name       String
+  keyHash    String   @unique
+  keyPrefix  String
+  scopes     String[] @default([])
+
+  expiresAt  DateTime?
+  revokedAt  DateTime?
+  lastUsedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, revokedAt])
+  @@index([createdByUserId])
+  @@index([expiresAt])
+}
+
+model RefreshToken {
+  id        String    @id @default(cuid())
+  userId    String
+  tokenHash String    @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, revokedAt])
+  @@index([expiresAt])
+}
+
+model PasswordResetToken {
+  id        String    @id @default(cuid())
+  userId    String
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, usedAt])
+  @@index([expiresAt])
+}
+
+model OutboundMessage {
+  id              String         @id @default(cuid())
+  organizationId  String
+  restaurantId    String?
+  reservationId   String?
+  createdByUserId String?
+  channel         MessageChannel
+  toPhone         String
+  body            String
+  status          String         @default("DISPATCHED")
+  createdAt       DateTime       @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  createdBy    User?        @relation("OutboundMessageCreatedBy", fields: [createdByUserId], references: [id], onDelete: SetNull)
+
+  @@index([organizationId, channel, createdAt])
+  @@index([createdByUserId])
 }
